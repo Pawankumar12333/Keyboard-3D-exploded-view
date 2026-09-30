@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Wireless Keyboard </title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { background: radial-gradient(ellipse at 50% 42%, #1b1b20 0%, #060607 58%, #000 100%); font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; color: #fff; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
+  .ui { position: fixed; left: 0; right: 0; text-align: center; pointer-events: none; user-select: none; }
+  .top { top: 0; padding-top: calc(28px + env(safe-area-inset-top, 0px)); }
+  .top h1 { margin: 0; font-weight: 200; font-size: clamp(18px, 3vw, 30px); letter-spacing: .5em; text-transform: uppercase; padding-left: .5em; }
+  .top p { margin: 10px 0 0; font-weight: 300; font-size: 12px; letter-spacing: .28em; opacity: .5; }
+  .bottom { bottom: 0; padding-bottom: calc(30px + env(safe-area-inset-bottom, 0px)); font-size: 12px; font-weight: 300; letter-spacing: .3em; animation: pulse 2.6s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: .8; } }
+  @media (prefers-reduced-motion: reduce) { .bottom { animation: none; opacity: .6; } }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div class="ui top"><h1>Wireless Keyboard</h1><p> Interactive 3D</p></div>
+<div class="ui bottom">Click to Explode / Reassemble</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+// ───────── Constants (world units; 1 unit = 1 key pitch) ─────────
+const BOARD_W = 15, BOARD_D = 5;            // key bed size
+const CASE_W = 16.2, CASE_D = 6.2;          // outer case size
+const HOLE_W = 15.3, HOLE_D = 5.3;          // opening in frame / walls
+const WALL_H = 0.75, FLOOR_H = 0.15;
+const FRAME_Y = 0.78, FRAME_DEPTH = 0.24, FRAME_BEVEL = 0.03;
+const PCB_Y = 0.65, PCB_H = 0.1;
+const KEY_Y = 1.05, KEY_H = 0.5, KEY_GAP = 0.1, KEY_DEPTH = 0.9;
+const TEX_PX = 112;                          // canvas pixels per key unit
+const LERP = 0.045;                          // explode easing factor per frame
+
+// ───────── Renderer / scene / camera ─────────
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x000000, 0);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x000000, 22, 60);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 9, 16);
+camera.lookAt(0, 0, 0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.minDistance = 8;
+controls.maxDistance = 32;
+controls.maxPolarAngle = Math.PI / 2.05;
+controls.target.set(0, 0, 0);
+
+// ───────── Lights ─────────
+scene.add(new THREE.HemisphereLight(0xbcc4d8, 0x080808, 0.5));
+const key = new THREE.DirectionalLight(0xffffff, 2.2);
+key.position.set(-8, 14, 8);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+Object.assign(key.shadow.camera, { left: -14, right: 14, top: 14, bottom: -14, near: 0.5, far: 45 });
+key.shadow.bias = -0.0004; key.shadow.normalBias = 0.02;
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x6f9bff, 1.6);
+rim.position.set(8, 6, -10);
+scene.add(rim);
+const fill = new THREE.PointLight(0xffffff, 40, 40, 2);
+fill.position.set(0, 4, 10);
+scene.add(fill);
+
+// ───────── Floor pool + contact shadow ─────────
+function radialTexture(stops) {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d'), gr = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  stops.forEach(([o, col]) => gr.addColorStop(o, col));
+  g.fillStyle = gr; g.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(c);
+}
+const floor = new THREE.Mesh(
+  new THREE.CircleGeometry(24, 64).rotateX(-Math.PI / 2),
+  new THREE.MeshStandardMaterial({ color: 0x17171c, roughness: 0.65, metalness: 0.2, transparent: true,
+    alphaMap: radialTexture([[0, '#fff'], [0.35, '#888'], [1, '#000']]), depthWrite: false })
+);
+floor.position.y = -0.13; floor.receiveShadow = true;
+scene.add(floor);
+const contact = new THREE.Mesh(
+  new THREE.CircleGeometry(1, 48).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ map: radialTexture([[0, 'rgba(0,0,0,.9)'], [1, 'rgba(0,0,0,0)']]), transparent: true, depthWrite: false })
+);
+contact.scale.set(10, 1, 4.2); contact.position.y = -0.125;
+scene.add(contact);
+
+// ───────── Shared materials ─────────
+const M = (o) => new THREE.MeshPhysicalMaterial(o);
+const mat = {
+  frame: M({ color: 0x151517, metalness: 0.85, roughness: 0.42, clearcoat: 0.3, clearcoatRoughness: 0.5 }),
+  caseM: M({ color: 0x0e0e10, metalness: 0.7, roughness: 0.5, clearcoat: 0.15 }),
+  keySide: M({ color: 0x0b0b0c, roughness: 0.6, metalness: 0 }),
+  pcb: M({ color: 0x0d5a2c, roughness: 0.6, metalness: 0.1 }),
+  gold: M({ color: 0xd4af37, metalness: 1, roughness: 0.3 }),
+  chip: M({ color: 0x050505, roughness: 0.4, metalness: 0.2 }),
+  rubber: M({ color: 0x0a0a0a, roughness: 0.9 }),
+  battery: M({ color: 0x111113, roughness: 0.5, clearcoat: 0.3 }),
+  steel: M({ color: 0x9a9da3, metalness: 1, roughness: 0.35 })
+};
+
+// ───────── Helpers ─────────
+/** Canvas texture: dark gradient cap top with centered white legend. */
+function makeKeyTexture(label, w, h, fontSize) {
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * TEX_PX); c.height = Math.round(h * TEX_PX);
+  const g = c.getContext('2d');
+  const gr = g.createLinearGradient(0, 0, 0, c.height);
+  gr.addColorStop(0, '#242427'); gr.addColorStop(1, '#0b0b0c');
+  g.fillStyle = gr; g.fillRect(0, 0, c.width, c.height);
+  g.strokeStyle = 'rgba(255,255,255,0.05)'; g.lineWidth = 3;
+  g.strokeRect(5, 5, c.width - 10, c.height - 10);
+  g.fillStyle = '#fff';
+  g.font = `600 ${fontSize}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  const lines = label.split('\n');
+  if (lines.length === 2) {           // shifted symbol on top, base legend below
+    g.fillText(lines[0], c.width / 2, c.height * 0.32);
+    g.fillText(lines[1], c.width / 2, c.height * 0.70);
+  } else {
+    g.fillText(label, c.width / 2, c.height / 2 + fontSize * 0.04);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
+  return t;
+}
+function makeLabelTexture(text, cw, ch, font, bg, fg) {
+  const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+  const g = c.getContext('2d');
+  if (bg) { g.fillStyle = bg; g.fillRect(0, 0, cw, ch); }
+  g.fillStyle = fg; g.font = font; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(text, cw / 2, ch / 2);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
+  return t;
+}
+/** Rectangular slab with optional rectangular hole, base at y=0 extruding up. */
+function slab(ow, od, iw, id, depth, bev = 0) {
+  const rect = (p, w, d) => { p.moveTo(-w / 2, -d / 2); p.lineTo(w / 2, -d / 2); p.lineTo(w / 2, d / 2); p.lineTo(-w / 2, d / 2); p.closePath(); };
+  const s = new THREE.Shape(); rect(s, ow, od);
+  const h = new THREE.Path(); rect(h, iw, id); s.holes.push(h);
+  const g = new THREE.ExtrudeGeometry(s, { depth, bevelEnabled: bev > 0, bevelSize: bev, bevelThickness: bev, bevelSegments: 2 });
+  return g.rotateX(-Math.PI / 2);
+}
+
+// ───────── Keyboard assembly ─────────
+const kb = new THREE.Group();
+scene.add(kb);
+const parts = [];
+const ex = (x, y, z) => new THREE.Vector3(x, y, z);
+
+/** Register a mesh: store original position + explode offset. */
+function addPart(mesh, offset, parent = kb) {
+  mesh.castShadow = mesh.receiveShadow = true;
+  mesh.userData.originalPos = mesh.position.clone();
+  mesh.userData.explodeOffset = offset;
+  parent.add(mesh); parts.push(mesh);
+  return mesh;
+}
+const box = (w, h, d, m) => new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+
+// 1. Top aluminum frame
+const frameMesh = new THREE.Mesh(slab(CASE_W, CASE_D, HOLE_W, HOLE_D, FRAME_DEPTH, FRAME_BEVEL), mat.frame);
+frameMesh.position.set(0, FRAME_Y, 0);
+addPart(frameMesh, ex(0, 1.2, 0));
+
+// 2. Keycaps
+const geoCache = {};
+const keyGeo = (w) => geoCache[w] || (geoCache[w] = new THREE.BoxGeometry(w - KEY_GAP, KEY_H, KEY_DEPTH));
+function addKey(label, x, row, w) {
+  const cx = x + w / 2 - BOARD_W / 2, cz = row + 0.5 - BOARD_D / 2;
+  const tex = makeKeyTexture(label, w - KEY_GAP, KEY_DEPTH, label.includes('\n') ? 38 : label.length > 1 ? 26 : 50);
+  const top = M({ map: tex, emissiveMap: tex, emissive: 0x555555, roughness: 0.55, clearcoat: 0.5, clearcoatRoughness: 0.3, envMapIntensity: 0.8 });
+  const s = mat.keySide;
+  const m = new THREE.Mesh(keyGeo(w), [s, s, top, s, s, s]);
+  m.position.set(cx, KEY_Y, cz);
+  addPart(m, ex(cx * 0.14, 2.6 + row * 0.08, cz * 0.14 + row * 0.1));
+}
+const SHIFTED = { '`': '~', '1': '!', '2': '@', '3': '#', '4': '$', '5': '%', '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
+  '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|', ';': ':', '\'': '"', ',': '<', '.': '>', '/': '?' };
+const chars = (str) => str.split('').map((c) => [SHIFTED[c] ? SHIFTED[c] + '\n' + c : c, 1]);
+const bk = (c, w) => [SHIFTED[c] + '\n' + c, w];
+// Every row totals exactly BOARD_W (15u): no gaps
+const ROWS = [
+  chars('`1234567890-=').concat([['Backspace', 2]]),
+  [['Tab', 1.5]].concat(chars('QWERTYUIOP[]'), [bk('\\', 1.5)]),
+  [['Caps', 1.75]].concat(chars('ASDFGHJKL;\''), [['Enter', 2.25]]),
+  [['Shift', 1.75]].concat(chars('ZXCVBNM,./'), [['Shift', 1.25], ['↑', 1], ['PgUp', 1]]),
+  [['Ctrl', 1.25], ['Win', 1.25], ['Alt', 1.25], ['Space', 5.25], ['Alt', 1], ['Fn', 1], ['Ctrl', 1], ['←', 1], ['↓', 1], ['→', 1]]
+];
+ROWS.forEach((keys, r) => { let x = 0; keys.forEach(([l, w]) => { addKey(l, x, r, w); x += w; }); });
+
+// 3. PCB, traces, chips
+const pcb = addPart(Object.assign(box(BOARD_W - 0.2, PCB_H, BOARD_D - 0.3, mat.pcb), {}), ex(0, -1.0, 0));
+pcb.position.y = PCB_Y; pcb.userData.originalPos.copy(pcb.position);
+for (let r = 0; r < 5; r++) {
+  const t = box(14.6, 0.02, 0.06, mat.gold); t.position.set(0, 0.71, r - 2); t.userData = {};
+  t.castShadow = false; addPart(t, ex(0, -1.0, 0));
+}
+for (let i = 0; i < 6; i++) {
+  const t = box(0.06, 0.02, 4.6, mat.gold); t.position.set(-6 + i * 2.4, 0.71, 0);
+  t.castShadow = false; addPart(t, ex(0, -1.0, 0));
+}
+[[5.2, 1.2], [3.4, 1.2]].forEach(([x, z]) => {
+  const c = box(1.0, 0.08, 1.0, mat.chip); c.position.set(x, 0.75, z); addPart(c, ex(0, -1.0, 0));
+});
+
+// 4. Battery pack
+const bat = new THREE.Mesh(new RoundedBoxGeometry(5, 0.38, 2.4, 4, 0.1), mat.battery);
+bat.position.set(-4.5, 0.34, 1.2); addPart(bat, ex(3.5, -2.2, 2.5));
+const batLabel = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.2).rotateX(-Math.PI / 2),
+  new THREE.MeshStandardMaterial({ map: makeLabelTexture('3000mAh Li-ion', 512, 192, '600 56px Helvetica, Arial, sans-serif', '#c9ccd2', '#111'), roughness: 0.6 }));
+batLabel.position.y = 0.192; bat.add(batLabel);
+[-0.4, 0.4].forEach((z) => { const t = box(0.12, 0.14, 0.3, mat.gold); t.position.set(2.56, 0, z); bat.add(t); });
+
+// 5. Bottom case: walls, floor plate, USB-C, power switch
+const caseDrop = ex(0, -3.2, 0);
+addPart(new THREE.Mesh(slab(CASE_W, CASE_D, HOLE_W, HOLE_D, WALL_H), mat.caseM), caseDrop);
+const plate = box(CASE_W, FLOOR_H, CASE_D, mat.caseM); plate.position.y = FLOOR_H / 2; addPart(plate, caseDrop);
+const under = new THREE.Mesh(new THREE.PlaneGeometry(7, 1).rotateX(Math.PI / 2),
+  new THREE.MeshStandardMaterial({ map: makeLabelTexture('WIRELESS MECHANICAL', 1024, 146, '300 70px Helvetica, Arial, sans-serif', null, '#8a8a90'), transparent: true, roughness: 0.6 }));
+under.position.y = -0.002; plate.add(under);
+const usb = box(0.9, 0.3, 0.3, mat.steel); usb.position.set(0, 0.42, -CASE_D / 2 - 0.05); addPart(usb, ex(0, -3.2, -0.8));
+const sw = box(0.5, 0.2, 0.25, mat.steel); sw.position.set(5, 0.45, -CASE_D / 2 - 0.05); addPart(sw, ex(0, -3.2, -0.8));
+
+// 6. Rubber feet
+[[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sz]) => {
+  const f = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.34, 0.12, 24), mat.rubber);
+  f.position.set(sx * 7.2, -0.06, sz * 2.6); addPart(f, ex(sx * 2.2, -4.6, sz * 1.8));
+});
+
+// ───────── Explode / assemble interaction ─────────
+let target = 0, progress = 0, moving = false;
+let down = null;
+const el = renderer.domElement;
+el.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY }; });
+el.addEventListener('pointerup', (e) => {
+  if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 5) { target = target ? 0 : 1; moving = true; }
+  down = null;
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+});
+
+// ───────── Render loop (no per-frame allocations) ─────────
+const clock = new THREE.Clock();
+function frame() {
+  requestAnimationFrame(frame);
+  const t = clock.getElapsedTime();
+  kb.rotation.y = Math.sin(t) * 0.04;
+  kb.rotation.x = Math.cos(t * 0.7) * 0.015;
+
+  if (moving) {
+    progress += (target - progress) * LERP;
+    if (Math.abs(target - progress) < 0.0005) { progress = target; moving = false; }
+    const s = progress * progress * (3 - 2 * progress);
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      p.position.copy(p.userData.originalPos).addScaledVector(p.userData.explodeOffset, s);
+    }
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+frame();
+</script>
+</body>
+</html>
